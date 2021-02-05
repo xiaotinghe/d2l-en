@@ -1,0 +1,504 @@
+# 学习率调度
+:label:`sec_scheduler`
+
+到目前为止，我们主要关注如何更新权重向量的优化*算法*，而不是更新它们的“速率”。尽管如此，调整学习率通常与实际算法一样重要。有许多方面需要考虑：
+
+* 最明显的是，学习率的“大小”很重要。如果它太大，优化就会发散，如果它太小，训练时间太长，或者我们最终得到的结果不是最优的。我们之前已经看到问题的条件编号很重要(例如，有关详细信息，请参阅:numref:`sec_momentum`)。直观地说，它是最不敏感方向的变化量与最敏感方向的变化量之比。
+* 其次，腐烂的速度也同样重要。如果学习率仍然很高，我们可能最终只会在最小值附近反弹，从而不会达到最优。:numref:`sec_minibatch_sgd`详细讨论了这一点，我们在:numref:`sec_sgd`中分析了性能保证。简而言之，我们希望速率衰减，但可能比$\mathcal{O}(t^{-\frac{1}{2}})$更慢，这对于凸问题来说是一个很好的选择。
+* 另一个同样重要的方面是*初始化*。这既与最初如何设置参数有关(有关详细信息，请查看:numref:`sec_numerical_stability`)，也与它们最初如何发展有关。这被称为“热身”，也就是说，我们开始朝着解决方案前进的速度有多快。开始时的大步骤可能没有好处，特别是因为初始参数集是随机的。最初的更新方向可能也是毫无意义的。
+* 最后，有许多执行循环学习率调整的优化变量。这超出了本章的范围。我们建议读者回顾:cite:`Izmailov.Podoprikhin.Garipov.ea.2018`中的详细内容，例如，如何通过对参数的整个“路径”进行平均来获得更好的解决方案。
+
+鉴于管理学习率需要很多细节，大多数深度学习框架都有自动处理这一问题的工具。在本章中，我们将回顾不同时间表对准确性的影响，并展示如何通过*学习速率时间表*有效地管理这一影响。
+
+## 玩具问题
+
+我们从一个玩具问题开始，这个问题足够便宜，很容易计算，但又足够重要，足以说明一些关键方面。为此，我们选择了略微现代化的LeNet版本(`relu`而不是`sigmoid`的激活，MaxPooling而不是AveragePooling)，就像应用于Fashion-MNIST一样。此外，为了提高性能，我们对网络进行了混合。因为大部分代码都是标准的，所以我们只介绍基本知识，没有进一步的详细讨论。如有需要，请参阅:numref:`chap_cnn`获取更新器。
+
+```{.python .input}
+%matplotlib inline
+from d2l import mxnet as d2l
+from mxnet import autograd, gluon, init, lr_scheduler, np, npx
+from mxnet.gluon import nn
+npx.set_np()
+
+net = nn.HybridSequential()
+net.add(nn.Conv2D(channels=6, kernel_size=5, padding=2, activation='relu'),
+        nn.MaxPool2D(pool_size=2, strides=2),
+        nn.Conv2D(channels=16, kernel_size=5, activation='relu'),
+        nn.MaxPool2D(pool_size=2, strides=2),
+        nn.Dense(120, activation='relu'),
+        nn.Dense(84, activation='relu'),
+        nn.Dense(10))
+net.hybridize()
+loss = gluon.loss.SoftmaxCrossEntropyLoss()
+device = d2l.try_gpu()
+
+batch_size = 256
+train_iter, test_iter = d2l.load_data_fashion_mnist(batch_size=batch_size)
+
+# The code is almost identical to `d2l.train_ch6` defined in the 
+# lenet section of chapter convolutional neural networks
+def train(net, train_iter, test_iter, num_epochs, loss, trainer, device):
+    net.initialize(force_reinit=True, ctx=device, init=init.Xavier())
+    animator = d2l.Animator(xlabel='epoch', xlim=[0, num_epochs],
+                            legend=['train loss', 'train acc', 'test acc'])
+    for epoch in range(num_epochs):
+        metric = d2l.Accumulator(3)  # train_loss, train_acc, num_examples
+        for i, (X, y) in enumerate(train_iter):
+            X, y = X.as_in_ctx(device), y.as_in_ctx(device)
+            with autograd.record():
+                y_hat = net(X)
+                l = loss(y_hat, y)
+            l.backward()
+            trainer.step(X.shape[0])
+            metric.add(l.sum(), d2l.accuracy(y_hat, y), X.shape[0])
+            train_loss = metric[0] / metric[2]
+            train_acc = metric[1] / metric[2]
+            if (i + 1) % 50 == 0:
+                animator.add(epoch + i / len(train_iter),
+                             (train_loss, train_acc, None))
+        test_acc = d2l.evaluate_accuracy_gpu(net, test_iter)
+        animator.add(epoch + 1, (None, None, test_acc))
+    print(f'train loss {train_loss:.3f}, train acc {train_acc:.3f}, '
+          f'test acc {test_acc:.3f}')
+```
+
+```{.python .input}
+#@tab pytorch
+%matplotlib inline
+from d2l import torch as d2l
+import math
+import torch
+from torch import nn
+from torch.optim import lr_scheduler
+
+def net_fn():
+    class Reshape(nn.Module):
+        def forward(self, x):
+            return x.view(-1,1,28,28)
+    
+    model = torch.nn.Sequential(
+        Reshape(),
+        nn.Conv2d(1, 6, kernel_size=5, padding=2), nn.ReLU(),
+        nn.MaxPool2d(kernel_size=2, stride=2),
+        nn.Conv2d(6, 16, kernel_size=5), nn.ReLU(),
+        nn.MaxPool2d(kernel_size=2, stride=2),
+        nn.Flatten(),
+        nn.Linear(16 * 5 * 5, 120), nn.ReLU(),
+        nn.Linear(120, 84), nn.ReLU(),
+        nn.Linear(84, 10))
+    
+    return model
+
+loss = nn.CrossEntropyLoss()
+device = d2l.try_gpu()
+
+batch_size = 256
+train_iter, test_iter = d2l.load_data_fashion_mnist(batch_size=batch_size)
+
+# The code is almost identical to `d2l.train_ch6` defined in the 
+# lenet section of chapter convolutional neural networks
+def train(net, train_iter, test_iter, num_epochs, loss, trainer, device, 
+          scheduler=None):
+    net.to(device)
+    animator = d2l.Animator(xlabel='epoch', xlim=[0, num_epochs],
+                            legend=['train loss', 'train acc', 'test acc'])
+
+    for epoch in range(num_epochs):
+        metric = d2l.Accumulator(3)  # train_loss, train_acc, num_examples
+        for i, (X, y) in enumerate(train_iter):
+            net.train()
+            trainer.zero_grad()
+            X, y = X.to(device), y.to(device)
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            l.backward()
+            trainer.step()
+            with torch.no_grad():
+                metric.add(l * X.shape[0], d2l.accuracy(y_hat, y), X.shape[0])
+            train_loss = metric[0] / metric[2]
+            train_acc = metric[1] / metric[2]
+            if (i + 1) % 50 == 0:
+                animator.add(epoch + i / len(train_iter),
+                             (train_loss, train_acc, None))
+        
+        test_acc = d2l.evaluate_accuracy_gpu(net, test_iter)
+        animator.add(epoch+1, (None, None, test_acc))
+    
+        if scheduler:
+            if scheduler.__module__ == lr_scheduler.__name__:
+                # Using PyTorch In-Built scheduler
+                scheduler.step()
+            else:
+                # Using custom defined scheduler
+                for param_group in trainer.param_groups:
+                    param_group['lr'] = scheduler(epoch)
+
+    print(f'train loss {train_loss:.3f}, train acc {train_acc:.3f}, '
+          f'test acc {test_acc:.3f}')
+```
+
+```{.python .input}
+#@tab tensorflow
+%matplotlib inline
+from d2l import tensorflow as d2l
+import tensorflow as tf
+import math
+from tensorflow.keras.callbacks import LearningRateScheduler
+
+def net():
+    return tf.keras.models.Sequential([
+        tf.keras.layers.Conv2D(filters=6, kernel_size=5, activation='relu',
+                               padding='same'),
+        tf.keras.layers.AvgPool2D(pool_size=2, strides=2),
+        tf.keras.layers.Conv2D(filters=16, kernel_size=5,
+                               activation='relu'),
+        tf.keras.layers.AvgPool2D(pool_size=2, strides=2),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(120, activation='relu'),
+        tf.keras.layers.Dense(84, activation='sigmoid'),
+        tf.keras.layers.Dense(10)])
+
+
+batch_size = 256
+train_iter, test_iter = d2l.load_data_fashion_mnist(batch_size=batch_size)
+
+# The code is almost identical to `d2l.train_ch6` defined in the 
+# lenet section of chapter convolutional neural networks
+def train(net_fn, train_iter, test_iter, num_epochs, lr,
+              device=d2l.try_gpu(), custom_callback = False):
+    device_name = device._device_name
+    strategy = tf.distribute.OneDeviceStrategy(device_name)
+    with strategy.scope():
+        optimizer = tf.keras.optimizers.SGD(learning_rate=lr)
+        loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        net = net_fn()
+        net.compile(optimizer=optimizer, loss=loss, metrics=['accuracy'])
+    callback = d2l.TrainCallback(net, train_iter, test_iter, num_epochs,
+                             device_name)
+    if custom_callback is False:
+        net.fit(train_iter, epochs=num_epochs, verbose=0, 
+                callbacks=[callback])
+    else:
+         net.fit(train_iter, epochs=num_epochs, verbose=0,
+                 callbacks=[callback, custom_callback])
+    return net
+```
+
+让我们来看一下，如果我们使用默认设置调用此算法，例如$0.3$的学习率和$30$次迭代的训练，会发生什么。注意训练精度是如何持续增加的，而测试精度方面的进步却停滞不前。两条曲线之间的间隙表示过拟合。
+
+```{.python .input}
+lr, num_epochs = 0.3, 30
+net.initialize(force_reinit=True, ctx=device, init=init.Xavier())
+trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': lr})
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab pytorch
+lr, num_epochs = 0.3, 30
+net = net_fn()
+trainer = torch.optim.SGD(net.parameters(), lr=lr)
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab tensorflow
+lr, num_epochs = 0.3, 30
+train(net, train_iter, test_iter, num_epochs, lr)
+```
+
+## 调度程序
+
+调整学习速率的一种方法是在每个步骤中明确设置。这可以通过`set_learning_rate`方法方便地实现。我们可以在每个时期(甚至在每个小批量之后)向下调整它，例如，以动态方式响应优化的进展情况。
+
+```{.python .input}
+trainer.set_learning_rate(0.1)
+print(f'learning rate is now {trainer.learning_rate:.2f}')
+```
+
+```{.python .input}
+#@tab pytorch
+lr = 0.1
+trainer.param_groups[0]["lr"] = lr
+print(f'learning rate is now {trainer.param_groups[0]["lr"]:.2f}')
+```
+
+```{.python .input}
+#@tab tensorflow
+lr = 0.1
+dummy_model = tf.keras.models.Sequential([tf.keras.layers.Dense(10)])
+dummy_model.compile(tf.keras.optimizers.SGD(learning_rate=lr), loss='mse')
+print(f'learning rate is now ,', dummy_model.optimizer.lr.numpy())
+```
+
+更广泛地说，我们希望定义一个调度程序。当使用更新次数调用时，它返回学习速率的相应值。让我们定义一个将学习率设置为$\eta = \eta_0 (t + 1)^{-\frac{1}{2}}$的简单函数。
+
+```{.python .input}
+#@tab all
+class SquareRootScheduler:
+    def __init__(self, lr=0.1):
+        self.lr = lr
+
+    def __call__(self, num_update):
+        return self.lr * pow(num_update + 1.0, -0.5)
+```
+
+让我们画出它在一系列值上的行为。
+
+```{.python .input}
+#@tab all
+scheduler = SquareRootScheduler(lr=0.1)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+现在，让我们看看在Fashion-MNIST的培训中这是如何进行的。我们只需提供调度器作为训练算法的附加参数。
+
+```{.python .input}
+trainer = gluon.Trainer(net.collect_params(), 'sgd',
+                        {'lr_scheduler': scheduler})
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab pytorch
+net = net_fn()
+trainer = torch.optim.SGD(net.parameters(), lr)
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device, 
+      scheduler)
+```
+
+```{.python .input}
+#@tab tensorflow
+train(net, train_iter, test_iter, num_epochs, lr,
+      custom_callback=LearningRateScheduler(scheduler))
+```
+
+这比以前好多了。有两件事很突出：曲线比以前平滑得多。其次，不太合身。不幸的是，为什么某些策略会导致理论上的不那么过度，这并不是一个得到很好解决的问题。有些人认为步长越小，参数越接近零，因此就越简单。然而，这并不能完全解释这种现象，因为我们并不是真的提前停止，而只是轻轻地降低学习速度。
+
+## 政策
+
+虽然我们不可能涵盖所有种类的学习速率调度器，但我们尝试在下面简要概述一下流行的策略。常见的选择是多项式衰减和分段常数调度。除此之外，余弦学习速率表已经被发现在一些问题上有很好的经验性效果。最后，在某些问题上，在使用大学习率之前预热优化器是有益的。
+
+### 因子调度器
+
+多项式衰减的一种替代方案是乘法衰减，即$\eta_{t+1} \leftarrow \eta_t \cdot \alpha$比$\alpha \in (0, 1)$。为了防止学习率衰减超过合理的下限，更新方程通常被修改为$\eta_{t+1} \leftarrow \mathop{\mathrm{max}}(\eta_{\mathrm{min}}, \eta_t \cdot \alpha)$。
+
+```{.python .input}
+#@tab all
+class FactorScheduler:
+    def __init__(self, factor=1, stop_factor_lr=1e-7, base_lr=0.1):
+        self.factor = factor
+        self.stop_factor_lr = stop_factor_lr
+        self.base_lr = base_lr
+
+    def __call__(self, num_update):
+        self.base_lr = max(self.stop_factor_lr, self.base_lr * self.factor)
+        return self.base_lr
+
+scheduler = FactorScheduler(factor=0.9, stop_factor_lr=1e-2, base_lr=2.0)
+d2l.plot(d2l.arange(50), [scheduler(t) for t in range(50)])
+```
+
+这也可以由mxnet中的内置调度器通过`lr_scheduler.FactorScheduler`对象来完成。它需要更多的参数，如预热周期、预热模式(线性或恒定)、所需更新的最大数量等；接下来，我们将根据需要使用内置调度器，并在此仅解释其功能。如图所示，如果需要，构建您自己的调度器是相当简单的。
+
+### 多因素调度器
+
+训练深度网络的一种常见策略是保持学习率分段恒定，并不时地将其降低给定的量。也就是说，给定一组何时降低比率的时间，例如$s = \{5, 10, 20\}$，每当$t \in s$就减少$\eta_{t+1} \leftarrow \eta_t \cdot \alpha$。假设每个步骤的值减半，我们可以按如下方式实现。
+
+```{.python .input}
+scheduler = lr_scheduler.MultiFactorScheduler(step=[15, 30], factor=0.5,
+                                              base_lr=0.5)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+```{.python .input}
+#@tab pytorch
+net = net_fn()
+trainer = torch.optim.SGD(net.parameters(), lr=0.5)
+scheduler = lr_scheduler.MultiStepLR(trainer, milestones=[15, 30], gamma=0.5)
+
+def get_lr(trainer, scheduler):
+    lr = scheduler.get_last_lr()[0]
+    trainer.step()
+    scheduler.step()
+    return lr
+
+d2l.plot(d2l.arange(num_epochs), [get_lr(trainer, scheduler) 
+                                  for t in range(num_epochs)])
+```
+
+```{.python .input}
+#@tab tensorflow
+class MultiFactorScheduler:
+    def __init__(self, step, factor, base_lr):
+        self.step = step
+        self.factor = factor
+        self.base_lr = base_lr
+  
+    def __call__(self, epoch):
+        if epoch in self.step:
+            self.base_lr = self.base_lr * self.factor
+            return self.base_lr
+        else:
+            return self.base_lr
+
+scheduler = MultiFactorScheduler(step=[15, 30], factor=0.5, base_lr=0.5)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+这个分段恒定学习率计划背后的直觉是，让优化进行，直到根据权重向量的分布达到一个稳定点。然后(并且仅在那时)我们降低速率，以获得更高质量的代理到良好的局部最小值。下面的示例显示了这如何产生更好的解决方案。
+
+```{.python .input}
+trainer = gluon.Trainer(net.collect_params(), 'sgd',
+                        {'lr_scheduler': scheduler})
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab pytorch
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device, 
+      scheduler)
+```
+
+```{.python .input}
+#@tab tensorflow
+train(net, train_iter, test_iter, num_epochs, lr,
+      custom_callback=LearningRateScheduler(scheduler))
+```
+
+### 余弦调度器
+
+:cite:`Loshchilov.Hutter.2016`提出了一个相当令人费解的启发式方法。它依赖于这样的观察，即我们可能不想在一开始就太大幅度地降低学习率，而且，我们可能想要在最后使用非常小的学习率来“改进”解决方案。这导致具有如下函数形式的余弦式进度表，学习速率在$t \in [0, T]$范围内。
+
+$$\eta_t = \eta_T + \frac{\eta_0 - \eta_T}{2} \left(1 + \cos(\pi t/T)\right)$$
+
+这里$\eta_0$是初始学习速率，$\eta_T$是时间$T$的目标速率。此外，对于$t > T$，我们只需将值固定为$\eta_T$，而不会再次增加。在下面的示例中，我们设置了最大更新步骤$T = 20$。
+
+```{.python .input}
+scheduler = lr_scheduler.CosineScheduler(max_update=20, base_lr=0.3,
+                                         final_lr=0.01)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+```{.python .input}
+#@tab pytorch, tensorflow
+class CosineScheduler:
+    def __init__(self, max_update, base_lr=0.01, final_lr=0,
+               warmup_steps=0, warmup_begin_lr=0):
+        self.base_lr_orig = base_lr
+        self.max_update = max_update
+        self.final_lr = final_lr
+        self.warmup_steps = warmup_steps
+        self.warmup_begin_lr = warmup_begin_lr
+        self.max_steps = self.max_update - self.warmup_steps
+  
+    def get_warmup_lr(self, epoch):
+        increase = (self.base_lr_orig - self.warmup_begin_lr) \
+                       * float(epoch) / float(self.warmup_steps)
+        return self.warmup_begin_lr + increase
+
+    def __call__(self, epoch):
+        if epoch < self.warmup_steps:
+            return self.get_warmup_lr(epoch)
+        if epoch <= self.max_update:
+            self.base_lr = self.final_lr + (
+                self.base_lr_orig - self.final_lr) * (1 + math.cos(
+                math.pi * (epoch - self.warmup_steps) / self.max_steps)) / 2
+        return self.base_lr
+
+scheduler = CosineScheduler(max_update=20, base_lr=0.3, final_lr=0.01)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+在计算机视觉的背景下，这个时间表*可以*带来改进的结果。但是请注意，不能保证这样的改进(如下所示)。
+
+```{.python .input}
+trainer = gluon.Trainer(net.collect_params(), 'sgd',
+                        {'lr_scheduler': scheduler})
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab pytorch
+net = net_fn()
+trainer = torch.optim.SGD(net.parameters(), lr=0.3)
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device, 
+      scheduler)
+```
+
+```{.python .input}
+#@tab tensorflow
+train(net, train_iter, test_iter, num_epochs, lr,
+      custom_callback=LearningRateScheduler(scheduler))
+```
+
+### 热身
+
+在某些情况下，初始化参数不足以保证良好的解决方案。对于一些可能导致不稳定优化问题的高级网络设计来说，这尤其是一个问题。我们可以通过选择足够小的学习率来解决这个问题，以防止在开始时出现分歧。不幸的是，这意味着进展缓慢。相反，较大的学习率最初会导致分歧。
+
+解决这一困境的一个相当简单的办法是使用一个热身期，在此期间，学习率*增加*到其初始最大值，然后冷却该速率，直到优化过程结束。为简单起见，通常使用线性递增来实现此目的。这导致了如下所示的表格的时间表。
+
+```{.python .input}
+scheduler = lr_scheduler.CosineScheduler(20, warmup_steps=5, base_lr=0.3,
+                                         final_lr=0.01)
+d2l.plot(np.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+```{.python .input}
+#@tab pytorch, tensorflow
+scheduler = CosineScheduler(20, warmup_steps=5, base_lr=0.3, final_lr=0.01)
+d2l.plot(d2l.arange(num_epochs), [scheduler(t) for t in range(num_epochs)])
+```
+
+请注意，网络最初收敛得更好(特别是观察前5个时期的性能)。
+
+```{.python .input}
+trainer = gluon.Trainer(net.collect_params(), 'sgd',
+                        {'lr_scheduler': scheduler})
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device)
+```
+
+```{.python .input}
+#@tab pytorch
+net = net_fn()
+trainer = torch.optim.SGD(net.parameters(), lr=0.3)
+train(net, train_iter, test_iter, num_epochs, loss, trainer, device, 
+      scheduler)
+```
+
+```{.python .input}
+#@tab tensorflow
+train(net, train_iter, test_iter, num_epochs, lr,
+      custom_callback=LearningRateScheduler(scheduler))
+```
+
+预热可以应用于任何调度器(不仅仅是余弦)。有关学习速率时间表和更多实验的更详细讨论，请参见:cite:`Gotmare.Keskar.Xiong.ea.2018`。特别是，他们发现预热阶段限制了非常深的网络中参数的发散量。这在直觉上是有道理的，因为我们预计网络中那些在开始时花费最多时间来取得进展的部分由于随机初始化而会出现明显的分歧。
+
+## 摘要
+
+* 在训练过程中降低学习率可以提高精确度，并且(最令人费解的是)减少模型的过度拟合。
+* 每当进步停滞不前时，逐步降低学习率在实践中是有效的。从本质上讲，这确保了我们有效地收敛到合适的解，然后才能通过降低学习率来减少参数的固有方差。
+* 余弦调度器在解决一些计算机视觉问题时很流行。有关这种调度器的详细信息，请参见例如[GluonCV](http://gluon-cv.mxnet.io)。
+* 优化前的热身期可以防止发散。
+* 在深度学习中，优化服务于多个目的。除了最小化训练目标外，不同的优化算法选择和学习率调度还会导致测试集上的泛化和过拟合程度相当不同(对于相同的训练误差量)。
+
+## 练习
+
+1. 对给定固定学习速率的优化行为进行实验。你用这种方式能买到的最好的型号是什么？
+1. 如果改变学习率下降的指数，收敛性会发生怎样的变化？为便于您在实验中使用，请使用`PolyScheduler`。
+1. 将余弦调度器应用于大型计算机视觉问题，例如训练ImageNet。相对于其他调度程序，它对性能有何影响？
+1. 热身应该持续多长时间？
+1. 你能把优化和抽样联系起来吗？首先使用:cite:`Welling.Teh.2011`关于随机梯度朗之万动力学的结果。
+
+:begin_tab:`mxnet`
+[Discussions](https://discuss.d2l.ai/t/359)
+:end_tab:
+
+:begin_tab:`pytorch`
+[Discussions](https://discuss.d2l.ai/t/1080)
+:end_tab:
+
+:begin_tab:`tensorflow`
+[Discussions](https://discuss.d2l.ai/t/1081)
+:end_tab:
